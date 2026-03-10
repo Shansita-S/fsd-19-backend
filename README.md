@@ -1,4 +1,4 @@
-# Meeting Scheduling Management System - Backend
+# Schedulify – Smart Meeting Organizer  - Backend
 
 ## 📋 Project Overview
 A robust backend API for a Meeting Scheduling Management System that allows organizers to schedule meetings and participants to view them. The system prevents participant conflicts and ensures data persistence using MongoDB.
