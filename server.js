@@ -16,10 +16,7 @@ app.use(express.urlencoded({ extended: true }));
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/meetings', require('./routes/meetings'));
 app.use('/api/users', require('./routes/users'));
-// Complex features disabled to prevent errors
-// app.use('/api/action-items', require('./routes/actionItems'));
-// app.use('/api/analytics', require('./routes/analytics'));
-// app.use('/api/notifications', require('./routes/notifications'));
+app.use('/api/notifications', require('./routes/notifications'));
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {

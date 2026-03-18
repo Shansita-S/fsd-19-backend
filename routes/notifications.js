@@ -1,41 +1,29 @@
 const express = require('express');
 const router = express.Router();
-const { protect } = require('../middleware/auth');
 const Notification = require('../models/Notification');
+const Meeting = require('../models/Meeting');
+const { protect } = require('../middleware/auth');
 
 // @route   GET /api/notifications
-// @desc    Get all notifications for logged-in user
+// @desc    Get user's notifications
 // @access  Private
 router.get('/', protect, async (req, res) => {
   try {
-    const { unreadOnly = false, limit = 50, type } = req.query;
-    
-    const query = { recipient: req.user._id };
-    
-    if (unreadOnly === 'true') {
-      query.read = false;
-    }
-    
-    if (type) {
-      query.type = type;
-    }
-    
-    const notifications = await Notification.find(query)
-      .populate('meeting', 'title startTime endTime')
-      .populate('actionItem', 'title dueDate')
+    const notifications = await Notification.find({ user: req.user._id })
+      .populate('meeting', 'title startTime')
       .sort({ createdAt: -1 })
-      .limit(parseInt(limit));
-    
+      .limit(20);
+
+    // Get unread count
     const unreadCount = await Notification.countDocuments({
-      recipient: req.user._id,
+      user: req.user._id,
       read: false
     });
-    
+
     res.json({
       success: true,
-      count: notifications.length,
-      unreadCount,
-      data: notifications
+      notifications,
+      unreadCount
     });
   } catch (error) {
     console.error('Get notifications error:', error);
@@ -47,25 +35,61 @@ router.get('/', protect, async (req, res) => {
   }
 });
 
-// @route   GET /api/notifications/unread-count
-// @desc    Get count of unread notifications
+// @route   GET /api/notifications/check-reminders
+// @desc    Check for meeting reminders (called by frontend)
 // @access  Private
-router.get('/unread-count', protect, async (req, res) => {
+router.get('/check-reminders', protect, async (req, res) => {
   try {
-    const count = await Notification.countDocuments({
-      recipient: req.user._id,
-      read: false
-    });
+    const now = new Date();
+    const thirtyMinutesLater = new Date(now.getTime() + 30 * 60000);
     
+    // Find meetings starting in the next 30 minutes
+    const upcomingMeetings = await Meeting.find({
+      $or: [
+        { organizer: req.user._id },
+        { 'participants.user': req.user._id }
+      ],
+      startTime: {
+        $gte: now,
+        $lte: thirtyMinutesLater
+      },
+      status: 'scheduled'
+    }).populate('organizer', 'name');
+
+    const newNotifications = [];
+
+    for (const meeting of upcomingMeetings) {
+      // Check if reminder already exists
+      const existingReminder = await Notification.findOne({
+        user: req.user._id,
+        meeting: meeting._id,
+        type: 'reminder'
+      });
+
+      if (!existingReminder) {
+        // Create new reminder notification
+        const minutesUntil = Math.round((meeting.startTime - now) / 60000);
+        const notification = await Notification.create({
+          user: req.user._id,
+          meeting: meeting._id,
+          message: `Meeting "${meeting.title}" starts in ${minutesUntil} minutes`,
+          type: 'reminder'
+        });
+
+        await notification.populate('meeting', 'title startTime');
+        newNotifications.push(notification);
+      }
+    }
+
     res.json({
       success: true,
-      count
+      notifications: newNotifications
     });
   } catch (error) {
-    console.error('Get unread count error:', error);
+    console.error('Check reminders error:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to fetch unread count',
+      message: 'Failed to check reminders',
       error: error.message
     });
   }
@@ -78,52 +102,28 @@ router.put('/:id/read', protect, async (req, res) => {
   try {
     const notification = await Notification.findOne({
       _id: req.params.id,
-      recipient: req.user._id
+      user: req.user._id
     });
-    
+
     if (!notification) {
       return res.status(404).json({
         success: false,
         message: 'Notification not found'
       });
     }
-    
-    await notification.markAsRead();
-    
+
+    notification.read = true;
+    await notification.save();
+
     res.json({
       success: true,
-      message: 'Notification marked as read',
-      data: notification
+      message: 'Notification marked as read'
     });
   } catch (error) {
     console.error('Mark as read error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to mark notification as read',
-      error: error.message
-    });
-  }
-});
-
-// @route   PUT /api/notifications/read-all
-// @desc    Mark all notifications as read
-// @access  Private
-router.put('/read-all', protect, async (req, res) => {
-  try {
-    await Notification.updateMany(
-      { recipient: req.user._id, read: false },
-      { read: true, readAt: new Date() }
-    );
-    
-    res.json({
-      success: true,
-      message: 'All notifications marked as read'
-    });
-  } catch (error) {
-    console.error('Mark all as read error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to mark all notifications as read',
       error: error.message
     });
   }
@@ -136,77 +136,25 @@ router.delete('/:id', protect, async (req, res) => {
   try {
     const notification = await Notification.findOneAndDelete({
       _id: req.params.id,
-      recipient: req.user._id
+      user: req.user._id
     });
-    
+
     if (!notification) {
       return res.status(404).json({
         success: false,
         message: 'Notification not found'
       });
     }
-    
+
     res.json({
       success: true,
-      message: 'Notification deleted successfully'
+      message: 'Notification deleted'
     });
   } catch (error) {
     console.error('Delete notification error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to delete notification',
-      error: error.message
-    });
-  }
-});
-
-// @route   DELETE /api/notifications/clear-all
-// @desc    Clear all read notifications
-// @access  Private
-router.delete('/clear-all', protect, async (req, res) => {
-  try {
-    await Notification.deleteMany({
-      recipient: req.user._id,
-      read: true
-    });
-    
-    res.json({
-      success: true,
-      message: 'All read notifications cleared'
-    });
-  } catch (error) {
-    console.error('Clear all notifications error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to clear notifications',
-      error: error.message
-    });
-  }
-});
-
-// @route   POST /api/notifications/preferences
-// @desc    Update notification preferences
-// @access  Private
-router.post('/preferences', protect, async (req, res) => {
-  try {
-    const User = require('../models/User');
-    
-    const user = await User.findByIdAndUpdate(
-      req.user._id,
-      { notificationSettings: req.body },
-      { new: true }
-    );
-    
-    res.json({
-      success: true,
-      message: 'Notification preferences updated',
-      data: user.notificationSettings
-    });
-  } catch (error) {
-    console.error('Update preferences error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to update preferences',
       error: error.message
     });
   }

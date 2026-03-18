@@ -560,25 +560,26 @@ router.post('/:id/agenda', protect, authorize('ORGANIZER'), async (req, res) => 
     }));
     
     await meeting.save();
+    await meeting.populate('organizer participants.user', 'name email');
     
     res.json({
       success: true,
       message: 'Agenda updated successfully',
-      data: meeting.agenda
+      meeting
     });
   } catch (error) {
-    console.error('Update agenda error:', error);
+    console.error('Add agenda error:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to update agenda',
+      message: 'Failed to add agenda',
       error: error.message
     });
   }
 });
 
 // @route   POST /api/meetings/:id/notes
-// @desc    Add notes to a meeting
-// @access  Private
+// @desc    Add a note to a meeting
+// @access  Private (Anyone in the meeting)
 router.post('/:id/notes', protect, async (req, res) => {
   try {
     const meeting = await Meeting.findById(req.params.id);
@@ -590,219 +591,47 @@ router.post('/:id/notes', protect, async (req, res) => {
       });
     }
     
-    // Check access
+    // Check if user is organizer or participant
     const isOrganizer = meeting.organizer.toString() === req.user._id.toString();
     const isParticipant = meeting.participants.some(
-      p => p.user && p.user.toString() === req.user._id.toString()
+      p => p.user.toString() === req.user._id.toString()
     );
     
     if (!isOrganizer && !isParticipant) {
       return res.status(403).json({
         success: false,
-        message: 'Not authorized'
+        message: 'You must be part of the meeting to add notes'
       });
     }
     
-    const { content, isPrivate = false } = req.body;
+    const { content } = req.body;
+    
+    if (!content || !content.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Note content is required'
+      });
+    }
     
     meeting.notes.push({
-      content,
+      content: content.trim(),
       author: req.user._id,
-      isPrivate
+      createdAt: new Date()
     });
     
     await meeting.save();
-    await meeting.populate('notes.author', 'name email');
+    await meeting.populate('organizer participants.user notes.author', 'name email');
     
     res.json({
       success: true,
       message: 'Note added successfully',
-      data: meeting.notes[meeting.notes.length - 1]
+      meeting
     });
   } catch (error) {
     console.error('Add note error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to add note',
-      error: error.message
-    });
-  }
-});
-
-// @route   POST /api/meetings/:id/feedback
-// @desc    Submit feedback for a meeting
-// @access  Private
-router.post('/:id/feedback', protect, async (req, res) => {
-  try {
-    const meeting = await Meeting.findById(req.params.id);
-    
-    if (!meeting) {
-      return res.status(404).json({
-        success: false,
-        message: 'Meeting not found'
-      });
-    }
-    
-    // Check if already submitted feedback
-    const existingFeedback = meeting.feedback.find(
-      f => f.participant && f.participant.toString() === req.user._id.toString()
-    );
-    
-    if (existingFeedback) {
-      return res.status(400).json({
-        success: false,
-        message: 'Feedback already submitted'
-      });
-    }
-    
-    const { rating, comment, helpful, productive } = req.body;
-    
-    meeting.feedback.push({
-      participant: req.user._id,
-      rating,
-      comment,
-      helpful,
-      productive,
-      submittedAt: new Date()
-    });
-    
-    // Recalculate productivity score
-    meeting.analytics = meeting.analytics || {};
-    meeting.analytics.productivityScore = meeting.calculateProductivityScore();
-    
-    await meeting.save();
-    
-    res.json({
-      success: true,
-      message: 'Feedback submitted successfully'
-    });
-  } catch (error) {
-    console.error('Submit feedback error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to submit feedback',
-      error: error.message
-    });
-  }
-});
-
-// @route   PUT /api/meetings/:id/status
-// @desc    Update meeting status
-// @access  Private (ORGANIZER only)
-router.put('/:id/status', protect, authorize('ORGANIZER'), async (req, res) => {
-  try {
-    const meeting = await Meeting.findById(req.params.id);
-    
-    if (!meeting) {
-      return res.status(404).json({
-        success: false,
-        message: 'Meeting not found'
-      });
-    }
-    
-    if (meeting.organizer.toString() !== req.user._id.toString()) {
-      return res.status(403).json({
-        success: false,
-        message: 'Not authorized'
-      });
-    }
-    
-    const { status } = req.body;
-    
-    meeting.status = status;
-    
-    if (status === 'in-progress' && !meeting.analytics.actualStartTime) {
-      meeting.analytics.actualStartTime = new Date();
-      
-      const scheduledStart = new Date(meeting.startTime);
-      const actualStart = new Date();
-      meeting.analytics.lateStartMinutes = Math.max(0, Math.floor((actualStart - scheduledStart) / (1000 * 60)));
-    }
-    
-    if (status === 'completed' && !meeting.analytics.actualEndTime) {
-      meeting.analytics.actualEndTime = new Date();
-      
-      const scheduledEnd = new Date(meeting.endTime);
-      const actualEnd = new Date();
-      meeting.analytics.overrunMinutes = Math.max(0, Math.floor((actualEnd - scheduledEnd) / (1000 * 60)));
-      
-      meeting.analytics.actualDuration = Math.floor(
-        (meeting.analytics.actualEndTime - meeting.analytics.actualStartTime) / (1000 * 60)
-      );
-      
-      meeting.analytics.productivityScore = meeting.calculateProductivityScore();
-    }
-    
-    await meeting.save();
-    
-    res.json({
-      success: true,
-      message: 'Meeting status updated',
-      data: meeting
-    });
-  } catch (error) {
-    console.error('Update status error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to update status',
-      error: error.message
-    });
-  }
-});
-
-// @route   PUT /api/meetings/:id/respond
-// @desc    Respond to meeting invitation (accept/decline/tentative)
-// @access  Private (PARTICIPANT only)
-router.put('/:id/respond', protect, authorize('PARTICIPANT'), async (req, res) => {
-  try {
-    const meeting = await Meeting.findById(req.params.id);
-    
-    if (!meeting) {
-      return res.status(404).json({
-        success: false,
-        message: 'Meeting not found'
-      });
-    }
-    
-    const { response } = req.body; // 'accepted', 'declined', 'tentative'
-    
-    const participantIndex = meeting.participants.findIndex(
-      p => p.user && p.user.toString() === req.user._id.toString()
-    );
-    
-    if (participantIndex === -1) {
-      return res.status(404).json({
-        success: false,
-        message: 'You are not invited to this meeting'
-      });
-    }
-    
-    meeting.participants[participantIndex].status = response;
-    meeting.participants[participantIndex].responseTime = new Date();
-    
-    await meeting.save();
-    
-    // Create notification for organizer
-    const Notification = require('../models/Notification');
-    await Notification.create({
-      recipient: meeting.organizer,
-      type: response === 'accepted' ? 'participant-accepted' : 'participant-declined',
-      title: `Meeting Response: ${response}`,
-      message: `${req.user.name} has ${response} the meeting "${meeting.title}"`,
-      priority: 'low',
-      meeting: meeting._id
-    });
-    
-    res.json({
-      success: true,
-      message: `Meeting invitation ${response}`,
-      data: meeting
-    });
-  } catch (error) {
-    console.error('Respond to meeting error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to respond to meeting',
       error: error.message
     });
   }

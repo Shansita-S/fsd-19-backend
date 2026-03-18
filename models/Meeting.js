@@ -16,13 +16,7 @@ const meetingSchema = new mongoose.Schema({
   },
   endTime: {
     type: Date,
-    required: [true, 'End time is required'],
-    validate: {
-      validator: function(value) {
-        return value > this.startTime;
-      },
-      message: 'End time must be after start time'
-    }
+    required: [true, 'End time is required']
   },
   organizer: {
     type: mongoose.Schema.Types.ObjectId,
@@ -46,6 +40,33 @@ const meetingSchema = new mongoose.Schema({
     enum: ['scheduled', 'in-progress', 'completed', 'cancelled'],
     default: 'scheduled'
   },
+  // Agenda items for the meeting
+  agenda: [{
+    title: {
+      type: String,
+      required: true,
+      trim: true
+    },
+    description: String,
+    duration: Number, // in minutes
+    order: Number
+  }],
+  // Meeting notes
+  notes: [{
+    content: {
+      type: String,
+      required: true
+    },
+    author: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true
+    },
+    createdAt: {
+      type: Date,
+      default: Date.now
+    }
+  }],
   createdAt: {
     type: Date,
     default: Date.now
@@ -104,13 +125,27 @@ meetingSchema.statics.findAvailableSlots = async function(participantIds, durati
   
   let currentCheckTime = new Date(searchStart);
   
-  // Check each 30-minute slot
-  while (currentCheckTime < searchEnd && availableSlots.length < 10) {
+  // Skip to next business day start if starting outside business hours
+  if (currentCheckTime.getHours() < businessHourStart) {
+    currentCheckTime.setHours(businessHourStart, 0, 0, 0);
+  } else if (currentCheckTime.getHours() >= businessHourEnd) {
+    currentCheckTime.setDate(currentCheckTime.getDate() + 1);
+    currentCheckTime.setHours(businessHourStart, 0, 0, 0);
+  }
+  
+  // Check each 30-minute slot - search through entire date range
+  while (currentCheckTime < searchEnd) {
     const slotEnd = new Date(currentCheckTime.getTime() + duration * 60000);
     
-    // Check if within business hours
+    // Check if within business hours - both start and end must be within hours
     const hour = currentCheckTime.getHours();
-    const isBusinessHour = hour >= businessHourStart && hour < businessHourEnd;
+    const endHour = slotEnd.getHours();
+    const endMinutes = slotEnd.getMinutes();
+    
+    // Meeting must start and end within business hours
+    const isBusinessHour = hour >= businessHourStart && 
+                          hour < businessHourEnd && 
+                          (endHour < businessHourEnd || (endHour === businessHourEnd && endMinutes === 0));
     
     // Check if slot is free for all participants
     const isSlotFree = !busySlots.some(meeting => {
@@ -166,8 +201,25 @@ meetingSchema.statics.findBestCommonSlot = async function(participantIds, durati
     return { ...slot, score };
   });
   
-  // Return top 5 slots
-  return scoredSlots.sort((a, b) => b.score - a.score).slice(0, 5);
+  // Group slots by day to ensure distribution across multiple days
+  const slotsByDay = {};
+  scoredSlots.forEach(slot => {
+    const dateKey = slot.startTime.toISOString().split('T')[0];
+    if (!slotsByDay[dateKey]) {
+      slotsByDay[dateKey] = [];
+    }
+    slotsByDay[dateKey].push(slot);
+  });
+  
+  // Get top 2 slots from each day, then sort all by score
+  const distributedSlots = [];
+  Object.keys(slotsByDay).forEach(day => {
+    const daySlots = slotsByDay[day].sort((a, b) => b.score - a.score).slice(0, 2);
+    distributedSlots.push(...daySlots);
+  });
+  
+  // Return top 10 slots overall (distributed across days)
+  return distributedSlots.sort((a, b) => b.score - a.score).slice(0, 10);
 };
 
 module.exports = mongoose.model('Meeting', meetingSchema);
