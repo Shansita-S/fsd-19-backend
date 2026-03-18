@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
+const mongoose = require('mongoose');
 const Meeting = require('../models/Meeting');
 const User = require('../models/User');
 const { protect, authorize } = require('../middleware/auth');
@@ -91,29 +92,45 @@ router.post('/', protect, authorize('ORGANIZER'), [
         }
       }
 
-      // If there are conflicts, reject the meeting creation
+      // If there are conflicts, find alternative time slots
       if (conflicts.length > 0) {
+        // Calculate meeting duration in minutes
+        const durationMinutes = (end - start) / (1000 * 60);
+        
+        // Find suggested alternative slots
+        const suggestedSlots = await Meeting.findBestCommonSlot(
+          participants,
+          durationMinutes,
+          7 // Search next 7 days
+        );
+        
         return res.status(409).json({ 
           success: false, 
           message: 'Scheduling conflict detected. One or more participants have overlapping meetings.',
-          conflicts
+          conflicts,
+          suggestedSlots: suggestedSlots || []
         });
       }
     }
 
-    // Create meeting
-    const meeting = await Meeting.create({
+    // Create meeting with proper participant structure
+    const meeting = new Meeting({
       title,
       description,
       startTime: start,
       endTime: end,
       organizer: req.user._id,
-      participants: participants || []
+      participants: (participants || []).map(userId => ({
+        user: new mongoose.Types.ObjectId(userId),
+        status: 'pending'
+      }))
     });
+    
+    await meeting.save();
 
     // Populate organizer and participants
     await meeting.populate('organizer', 'name email');
-    await meeting.populate('participants', 'name email');
+    await meeting.populate('participants.user', 'name email');
 
     res.status(201).json({
       success: true,
@@ -141,13 +158,13 @@ router.get('/', protect, async (req, res) => {
       // Organizers see all meetings they created
       meetings = await Meeting.find({ organizer: req.user._id })
         .populate('organizer', 'name email')
-        .populate('participants', 'name email')
+        .populate('participants.user', 'name email')
         .sort('-startTime');
     } else {
       // Participants see only meetings they are invited to
-      meetings = await Meeting.find({ participants: req.user._id })
+      meetings = await Meeting.find({ 'participants.user': req.user._id })
         .populate('organizer', 'name email')
-        .populate('participants', 'name email')
+        .populate('participants.user', 'name email')
         .sort('-startTime');
     }
 
@@ -173,7 +190,7 @@ router.get('/:id', protect, async (req, res) => {
   try {
     const meeting = await Meeting.findById(req.params.id)
       .populate('organizer', 'name email')
-      .populate('participants', 'name email');
+      .populate('participants.user', 'name email');
 
     if (!meeting) {
       return res.status(404).json({ 
@@ -185,7 +202,7 @@ router.get('/:id', protect, async (req, res) => {
     // Check if user has access to this meeting
     const isOrganizer = meeting.organizer._id.toString() === req.user._id.toString();
     const isParticipant = meeting.participants.some(
-      p => p._id.toString() === req.user._id.toString()
+      p => p.user && p.user._id.toString() === req.user._id.toString()
     );
 
     if (!isOrganizer && !isParticipant) {
@@ -201,6 +218,74 @@ router.get('/:id', protect, async (req, res) => {
     });
   } catch (error) {
     console.error('Get meeting error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Server error',
+      error: error.message
+    });
+  }
+});
+
+// @route   POST /api/meetings/find-best-slot
+// @desc    Find best available slot for all participants (Auto-Schedule)
+// @access  Private (ORGANIZER only)
+router.post('/find-best-slot', protect, authorize('ORGANIZER'), [
+  body('participants').isArray().withMessage('Participants must be an array'),
+  body('duration').isInt({ min: 15, max: 480 }).withMessage('Duration must be between 15 and 480 minutes')
+], async (req, res) => {
+  try {
+    // Validate input
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        success: false, 
+        errors: errors.array() 
+      });
+    }
+
+    const { participants, duration, daysToSearch = 7 } = req.body;
+
+    // Verify all participants exist and are PARTICIPANT role
+    if (participants.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'At least one participant is required' 
+      });
+    }
+
+    const participantUsers = await User.find({ 
+      _id: { $in: participants },
+      role: 'PARTICIPANT'
+    });
+
+    if (participantUsers.length !== participants.length) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'One or more participants are invalid' 
+      });
+    }
+
+    // Find best common slots
+    const suggestedSlots = await Meeting.findBestCommonSlot(
+      participants,
+      duration,
+      daysToSearch
+    );
+
+    if (!suggestedSlots || suggestedSlots.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'No available slots found in the next ' + daysToSearch + ' days. Try extending the search period.' 
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Found ' + suggestedSlots.length + ' available slot(s)',
+      suggestedSlots
+    });
+  } catch (error) {
+    console.error('Find best slot error:', error);
     res.status(500).json({ 
       success: false, 
       message: 'Server error',
@@ -321,15 +406,29 @@ router.put('/:id', protect, authorize('ORGANIZER'), [
         }
 
         if (conflicts.length > 0) {
+          // Calculate meeting duration in minutes
+          const durationMinutes = (end - start) / (1000 * 60);
+          
+          // Find suggested alternative slots
+          const suggestedSlots = await Meeting.findBestCommonSlot(
+            participants,
+            durationMinutes,
+            7 // Search next 7 days
+          );
+          
           return res.status(409).json({ 
             success: false, 
             message: 'Scheduling conflict detected. One or more participants have overlapping meetings.',
-            conflicts
+            conflicts,
+            suggestedSlots: suggestedSlots || []
           });
         }
       }
       
-      updateData.participants = participants;
+      updateData.participants = participants.map(userId => ({
+        user: new mongoose.Types.ObjectId(userId),
+        status: 'pending'
+      }));
     }
 
     // Update meeting
@@ -339,7 +438,7 @@ router.put('/:id', protect, authorize('ORGANIZER'), [
       { new: true, runValidators: true }
     )
       .populate('organizer', 'name email')
-      .populate('participants', 'name email');
+      .populate('participants.user', 'name email');
 
     res.status(200).json({
       success: true,
@@ -389,6 +488,150 @@ router.delete('/:id', protect, authorize('ORGANIZER'), async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: 'Server error',
+      error: error.message
+    });
+  }
+});
+
+// @route   POST /api/meetings/smart-schedule
+// @desc    Find optimal meeting times using AI
+// @access  Private (ORGANIZER only)
+router.post('/smart-schedule', protect, authorize('ORGANIZER'), async (req, res) => {
+  try {
+    const { participants, duration = 60, startDate, endDate } = req.body;
+    
+    if (!participants || participants.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Participants are required'
+      });
+    }
+    
+    const start = startDate ? new Date(startDate) : new Date();
+    const end = endDate ? new Date(endDate) : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days from now
+    
+    const optimalTimes = await Meeting.findOptimalTimes(
+      participants,
+      duration,
+      start,
+      end
+    );
+    
+    res.json({
+      success: true,
+      message: 'Optimal meeting times found',
+      data: optimalTimes
+    });
+  } catch (error) {
+    console.error('Smart schedule error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to find optimal times',
+      error: error.message
+    });
+  }
+});
+
+// @route   POST /api/meetings/:id/agenda
+// @desc    Add agenda items to a meeting
+// @access  Private (ORGANIZER only)
+router.post('/:id/agenda', protect, authorize('ORGANIZER'), async (req, res) => {
+  try {
+    const meeting = await Meeting.findById(req.params.id);
+    
+    if (!meeting) {
+      return res.status(404).json({
+        success: false,
+        message: 'Meeting not found'
+      });
+    }
+    
+    if (meeting.organizer.toString() !== req.user._id.toString()) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized'
+      });
+    }
+    
+    const { agendaItems } = req.body;
+    meeting.agenda = agendaItems.map((item, index) => ({
+      ...item,
+      order: index
+    }));
+    
+    await meeting.save();
+    await meeting.populate('organizer participants.user', 'name email');
+    
+    res.json({
+      success: true,
+      message: 'Agenda updated successfully',
+      meeting
+    });
+  } catch (error) {
+    console.error('Add agenda error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to add agenda',
+      error: error.message
+    });
+  }
+});
+
+// @route   POST /api/meetings/:id/notes
+// @desc    Add a note to a meeting
+// @access  Private (Anyone in the meeting)
+router.post('/:id/notes', protect, async (req, res) => {
+  try {
+    const meeting = await Meeting.findById(req.params.id);
+    
+    if (!meeting) {
+      return res.status(404).json({
+        success: false,
+        message: 'Meeting not found'
+      });
+    }
+    
+    // Check if user is organizer or participant
+    const isOrganizer = meeting.organizer.toString() === req.user._id.toString();
+    const isParticipant = meeting.participants.some(
+      p => p.user.toString() === req.user._id.toString()
+    );
+    
+    if (!isOrganizer && !isParticipant) {
+      return res.status(403).json({
+        success: false,
+        message: 'You must be part of the meeting to add notes'
+      });
+    }
+    
+    const { content } = req.body;
+    
+    if (!content || !content.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Note content is required'
+      });
+    }
+    
+    meeting.notes.push({
+      content: content.trim(),
+      author: req.user._id,
+      createdAt: new Date()
+    });
+    
+    await meeting.save();
+    await meeting.populate('organizer participants.user notes.author', 'name email');
+    
+    res.json({
+      success: true,
+      message: 'Note added successfully',
+      meeting
+    });
+  } catch (error) {
+    console.error('Add note error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to add note',
       error: error.message
     });
   }
