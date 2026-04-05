@@ -40,6 +40,37 @@ const meetingSchema = new mongoose.Schema({
     enum: ['scheduled', 'in-progress', 'completed', 'cancelled'],
     default: 'scheduled'
   },
+  videoConference: {
+    provider: {
+      type: String,
+      enum: ['jitsi', 'talky', 'custom'],
+      default: 'talky'
+    },
+    roomName: {
+      type: String,
+      trim: true
+    },
+    joinUrl: {
+      type: String,
+      trim: true
+    }
+  },
+  recording: {
+    status: {
+      type: String,
+      enum: ['none', 'processing', 'available', 'failed'],
+      default: 'none'
+    },
+    recordingUrl: {
+      type: String,
+      trim: true
+    },
+    uploadedAt: Date,
+    uploadedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User'
+    }
+  },
   // Agenda items for the meeting
   agenda: [{
     title: {

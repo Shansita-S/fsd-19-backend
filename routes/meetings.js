@@ -2,9 +2,42 @@ const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
 const mongoose = require('mongoose');
+const { v4: uuidv4 } = require('uuid');
+const { Readable } = require('stream');
 const Meeting = require('../models/Meeting');
 const User = require('../models/User');
+const Notification = require('../models/Notification');
 const { protect, authorize } = require('../middleware/auth');
+
+const sanitizeRoomSegment = (value) => {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+};
+
+const buildDefaultJitsiRoom = ({ title, startTime, organizerId }) => {
+  const titleSegment = sanitizeRoomSegment(title) || 'meeting';
+  const dateSegment = new Date(startTime).toISOString().slice(0, 10).replace(/-/g, '');
+  const organizerSegment = String(organizerId).slice(-6);
+  const randomSegment = uuidv4().slice(0, 8);
+  return `${titleSegment}-${dateSegment}-${organizerSegment}-${randomSegment}`;
+};
+
+const buildDefaultJitsiJoinUrl = (roomName) => {
+  return `https://meet.jit.si/${roomName}#config.prejoinPageEnabled=false&config.enableWelcomePage=false&config.requireDisplayName=false`;
+};
+
+const buildDefaultTalkyJoinUrl = (roomName) => {
+  return `https://talky.io/${roomName}`;
+};
+
+const resolveBuiltInProvider = () => {
+  const provider = (process.env.MEETING_PROVIDER || 'talky').toLowerCase();
+  if (provider === 'jitsi') return 'jitsi';
+  return 'talky';
+};
 
 // @route   POST /api/meetings
 // @desc    Create a new meeting
@@ -25,7 +58,7 @@ router.post('/', protect, authorize('ORGANIZER'), [
       });
     }
 
-    const { title, description, startTime, endTime, participants } = req.body;
+    const { title, description, startTime, endTime, participants, joinUrl, roomName } = req.body;
 
     // Convert to Date objects
     const start = new Date(startTime);
@@ -113,6 +146,18 @@ router.post('/', protect, authorize('ORGANIZER'), [
       }
     }
 
+    const computedRoomName = roomName || buildDefaultJitsiRoom({
+      title,
+      startTime: start,
+      organizerId: req.user._id
+    });
+
+    const builtInProvider = resolveBuiltInProvider();
+    const computedJoinUrl = joinUrl
+      || (builtInProvider === 'jitsi'
+        ? buildDefaultJitsiJoinUrl(computedRoomName)
+        : buildDefaultTalkyJoinUrl(computedRoomName));
+
     // Create meeting with proper participant structure
     const meeting = new Meeting({
       title,
@@ -120,6 +165,11 @@ router.post('/', protect, authorize('ORGANIZER'), [
       startTime: start,
       endTime: end,
       organizer: req.user._id,
+      videoConference: {
+        provider: joinUrl ? 'custom' : builtInProvider,
+        roomName: computedRoomName,
+        joinUrl: computedJoinUrl
+      },
       participants: (participants || []).map(userId => ({
         user: new mongoose.Types.ObjectId(userId),
         status: 'pending'
@@ -131,6 +181,16 @@ router.post('/', protect, authorize('ORGANIZER'), [
     // Populate organizer and participants
     await meeting.populate('organizer', 'name email');
     await meeting.populate('participants.user', 'name email');
+
+    if (meeting.participants.length > 0) {
+      const notifications = meeting.participants.map((participant) => ({
+        user: participant.user._id,
+        meeting: meeting._id,
+        type: 'info',
+        message: `You have been invited to "${meeting.title}". Join link: ${meeting.videoConference?.joinUrl || 'TBA'}`
+      }));
+      await Notification.insertMany(notifications);
+    }
 
     res.status(201).json({
       success: true,
@@ -632,6 +692,154 @@ router.post('/:id/notes', protect, async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Failed to add note',
+      error: error.message
+    });
+  }
+});
+
+// @route   POST /api/meetings/:id/recording
+// @desc    Add recording link and notify participants
+// @access  Private (ORGANIZER only - own meeting)
+router.post('/:id/recording', protect, authorize('ORGANIZER'), [
+  body('recordingUrl')
+    .trim()
+    .matches(/^https?:\/\/.+/i)
+    .withMessage('A valid recording URL is required')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        errors: errors.array()
+      });
+    }
+
+    const meeting = await Meeting.findById(req.params.id);
+    if (!meeting) {
+      return res.status(404).json({
+        success: false,
+        message: 'Meeting not found'
+      });
+    }
+
+    if (meeting.organizer.toString() !== req.user._id.toString()) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to upload recording for this meeting'
+      });
+    }
+
+    const { recordingUrl } = req.body;
+    meeting.recording = {
+      status: 'available',
+      recordingUrl,
+      uploadedAt: new Date(),
+      uploadedBy: req.user._id
+    };
+
+    await meeting.save();
+    await meeting.populate('participants.user', 'name email');
+
+    if (meeting.participants.length > 0) {
+      const notifications = meeting.participants.map((participant) => ({
+        user: participant.user._id,
+        meeting: meeting._id,
+        type: 'recording',
+        message: `Recording is now available for "${meeting.title}": ${recordingUrl}`
+      }));
+      await Notification.insertMany(notifications);
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Recording saved and shared with participants',
+      meeting
+    });
+  } catch (error) {
+    console.error('Add recording error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to save recording',
+      error: error.message
+    });
+  }
+});
+
+// @route   GET /api/meetings/:id/recording/download
+// @desc    Download meeting recording for organizer/invited participants
+// @access  Private
+router.get('/:id/recording/download', protect, async (req, res) => {
+  try {
+    const meeting = await Meeting.findById(req.params.id);
+
+    if (!meeting) {
+      return res.status(404).json({
+        success: false,
+        message: 'Meeting not found'
+      });
+    }
+
+    const isOrganizer = meeting.organizer.toString() === req.user._id.toString();
+    const participantEntry = meeting.participants.find(
+      (p) => p.user && p.user.toString() === req.user._id.toString()
+    );
+    const isEligibleParticipant = Boolean(participantEntry && participantEntry.status !== 'declined');
+
+    if (!isOrganizer && !isEligibleParticipant) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to download this recording'
+      });
+    }
+
+    const recordingUrl = meeting.recording?.recordingUrl;
+    if (!recordingUrl) {
+      return res.status(404).json({
+        success: false,
+        message: 'Recording is not available yet'
+      });
+    }
+
+    if (recordingUrl.includes('recordings.example.com')) {
+      return res.status(409).json({
+        success: false,
+        message: 'This meeting has an old placeholder recording URL. Please update recording URL in meeting details.'
+      });
+    }
+
+    const upstream = await fetch(recordingUrl);
+    if (!upstream.ok || !upstream.body) {
+      return res.status(502).json({
+        success: false,
+        message: 'Unable to fetch recording from source'
+      });
+    }
+
+    const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
+    const safeTitle = String(meeting.title || 'meeting-recording')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 50) || 'meeting-recording';
+
+    let extension = 'bin';
+    if (contentType.includes('mp4')) extension = 'mp4';
+    else if (contentType.includes('webm')) extension = 'webm';
+    else if (contentType.includes('mpeg')) extension = 'mp3';
+    else if (contentType.includes('wav')) extension = 'wav';
+
+    const filename = `${safeTitle}-recording.${extension}`;
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    Readable.fromWeb(upstream.body).pipe(res);
+  } catch (error) {
+    console.error('Download recording error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to download recording',
       error: error.message
     });
   }
