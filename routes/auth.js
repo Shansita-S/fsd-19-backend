@@ -32,9 +32,10 @@ router.post('/register', [
     }
 
     const { name, email, password, role } = req.body;
+    const normalizedEmail = String(email || '').trim().toLowerCase();
 
     // Check if user already exists
-    const existingUser = await User.findOne({ email });
+    const existingUser = await User.findOne({ email: normalizedEmail });
     if (existingUser) {
       return res.status(400).json({ 
         success: false, 
@@ -45,7 +46,7 @@ router.post('/register', [
     // Create user
     const user = await User.create({
       name,
-      email,
+      email: normalizedEmail,
       password,
       role
     });
@@ -65,6 +66,13 @@ router.post('/register', [
       }
     });
   } catch (error) {
+    if (error && error.code === 11000 && error.keyPattern?.email) {
+      return res.status(400).json({
+        success: false,
+        message: 'User already exists with this email'
+      });
+    }
+
     console.error('Register error:', error);
     res.status(500).json({ 
       success: false, 
@@ -92,9 +100,10 @@ router.post('/login', [
     }
 
     const { email, password } = req.body;
+    const normalizedEmail = String(email || '').trim().toLowerCase();
 
     // Check if user exists (include password field)
-    const user = await User.findOne({ email }).select('+password');
+    const user = await User.findOne({ email: normalizedEmail }).select('+password');
     if (!user) {
       return res.status(401).json({ 
         success: false, 
